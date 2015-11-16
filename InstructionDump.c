@@ -9,6 +9,10 @@ HWND             hwmain;               // Handle of main OllyDbg window
 
 FILE *file;
 
+uchar *output;		// string of instructions which are going to be written in a file
+uint outputPos;		// last position in output string
+uint outputSize;
+
 //	configuration variables, read at the startup
 uint numberOfInstructions;	// how many instructions to read
 uint numberOfJumps;			// how deep is recursion going to be
@@ -17,6 +21,8 @@ uint nextInstructionAddress; // address of instruction after call/jxx instructio
 
 //	function for dumping instructions
 void cdecl recordInstructions(t_disasm *disasm, uint depth);
+
+void writeOutput();
 
 
 BOOL WINAPI DllEntryPoint(HINSTANCE hi,DWORD reason,LPVOID reserved) {
@@ -41,10 +47,17 @@ extc int _export cdecl ODBG_Plugininit(int ollydbgversion,HWND hw,ulong *feature
 
    nextInstructionAddress = 0;  //	setting flag down
 
+
    //	reading configuration file
    file = fopen("instDump.conf", "r");
    fscanf(file, "%lu %lu", &numberOfInstructions, &numberOfJumps);
    fclose(file);
+
+   outputSize = numberOfInstructions * numberOfJumps * 2;
+   
+   output = (uchar*) malloc(outputSize);
+
+   outputPos = 0;
 
   //	dump file
    file = fopen("instructionDump.txt", "w");
@@ -57,6 +70,7 @@ extc int _export cdecl ODBG_Plugininit(int ollydbgversion,HWND hw,ulong *feature
 
 extc void _export cdecl ODBG_Plugindestroy(void) {
 	fclose(file);
+	free(output);
 };
 
 extc int _export cdecl ODBG_Pluginmenu(int origin,char data[4096],void *item) {
@@ -68,6 +82,12 @@ extc int _export cdecl ODBG_Pluginmenu(int origin,char data[4096],void *item) {
   };
   return 0;                           
 };
+
+extc void cdecl ODBG_Pluginreset(void) {
+	fclose(file);
+	file = fopen("instructionDump.txt", "w");
+	outputPos = 0;
+}
 
 
 extc void _export cdecl ODBG_Pluginaction(int origin,int action,void *item) {
@@ -90,9 +110,9 @@ extc int _export cdecl ODBG_Paused(int reason, t_reg *reg) {
 	case PP_EVENT:
 		if(nextInstructionAddress != 0) {		//	if previous instruction was CALL/JXX
 			if(reg->ip == nextInstructionAddress) // if current instruction is instruction after CALL/JXX instruction
-				fprintf(file, "0\n");			// command was step over
+				fprintf(file, "\n0\n");			// command was step over
 			else								// if current instruction is one pointed to by CALL/JXX
-				fprintf(file, "1\n");			// command was step into
+				fprintf(file, "\n1\n");			// command was step into
 
 			nextInstructionAddress = 0;			// reset flag
 		}
@@ -100,15 +120,19 @@ extc int _export cdecl ODBG_Paused(int reason, t_reg *reg) {
 		srcsize = Readcommand(reg->ip, (char*)cmd); 
 
 		if(srcsize != 0) {
+
 			srcsize = Disasm(cmd, srcsize, reg->ip, DEC_UNKNOWN, &disasm, DISASM_ALL, NULL);
 
 			if(disasm.error != 0)
 				break;
 
-			if(disasm.cmdtype == C_JMC || disasm.cmdtype == C_CAL) {  // if instruction is CALL/JXX
+			if(/*disasm.cmdtype == C_JMC || */disasm.cmdtype == C_CAL) {  // if instruction is CALL/JXX
 				nextInstructionAddress = reg->ip + srcsize;			// set flag
 				recordInstructions(&disasm, 0);						// dump instructions
 			}
+
+			if(outputPos != 0)
+				writeOutput();
 
 			return 1;
 		}
@@ -116,12 +140,18 @@ extc int _export cdecl ODBG_Paused(int reason, t_reg *reg) {
 	return 0;
 };
 
+void writeOutput() {
+	output[outputPos] = '\0';
+	fprintf(file, "%s", output);
+	outputPos = 0;
+}
+
 void cdecl recordInstructions(t_disasm *disasm, uint depth) {	//  Readcommand -> readmemory ?
 	ulong ip = disasm->jmpaddr;						
 	ulong srcsize;
 	uchar cmd[MAXCMDSIZE]; 
 	t_disasm dis;
-	int i;
+	int i, j;
 
 	for(i = 0; i < numberOfInstructions; i++) {
 		srcsize = Readcommand(ip,(char*)cmd);
@@ -132,10 +162,19 @@ void cdecl recordInstructions(t_disasm *disasm, uint depth) {	//  Readcommand ->
 			if(dis.error != 0)
 				break;
 
-			fprintf(file, "%s\n", dis.result);
+			//fprintf(file, "%s", dis.dump);
+
+			for(j = 0; dis.dump[j] != '\0'; j++) {
+				if(dis.dump[j] == ' ')
+					continue;
+				output[outputPos] = dis.dump[j];
+				outputPos++;
+				if(outputPos == (outputSize -1))
+					writeOutput();
+			}
 
 			if(depth < numberOfJumps) {
-				if(dis.cmdtype == C_JMC || dis.cmdtype == C_CAL)	// if instruction is CALL/JXX
+				if(/*dis.cmdtype == C_JMC || */dis.cmdtype == C_CAL)	// if instruction is CALL/JXX
 					recordInstructions(&dis, depth + 1);			// dump instructions
 			}
 
