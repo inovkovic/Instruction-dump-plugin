@@ -3,6 +3,7 @@
 #include <string>
 #include <vector>
 #include <algorithm>
+#include <fstream>
 
 #include "Plugin.h"
 
@@ -13,6 +14,10 @@ struct Configuration {
 	bool recordEntrance;		// whether to record steping in CALL instruction
 	bool recordRegMod;			// whether to record if registers were modified by user
 	bool recordReg;				// whether to record register values
+	bool recordStog;			// record stog state
+	uint stackSize;				// number of stog records to read in bytes
+	bool recordMemory;			// record memory which is referenced in registers
+	uint memorySize;			// how much memory to record in bytes
 };
 
 struct State {
@@ -20,6 +25,7 @@ struct State {
 	bool stepIn;							//	1 - command was STEP_IN 0 - command was STEP_OVER
 	std::vector<bool> regMod;				//  any register modified by user
 	bool wasCall;							//	last instruction was CALL
+	std::vector<char> stackDump;
 };
 
 HINSTANCE        hinst;                // DLL instance
@@ -28,7 +34,7 @@ HWND             hwmain;               // Handle of main OllyDbg window
 Configuration config;
 State		  state;
 
-FILE *file;
+std::fstream file;
 
 
 //	function for dumping instructions
@@ -55,18 +61,22 @@ extc int _export cdecl ODBG_Plugininit(int ollydbgversion,HWND hw,ulong *feature
    hwmain=hw;
 
    //	reading configuration file
-   file = fopen("instDump.conf", "r");
-   fscanf(file, "%s %lu %lu %d %d %d", config.logName, &config.numberOfInstructions, &config.numberOfJumps, &config.recordEntrance, &config.recordRegMod, &config.recordReg);
-   fclose(file);
+   file.open("instDump.conf", std::ios::in);
+ /*  fscanf(file, "%s %lu %lu %d %d %d", config.logName, &config.numberOfInstructions, &config.numberOfJumps, &config.recordEntrance, &config.recordRegMod, &config.recordReg);
+   fclose(file);*/
+   file >> config.logName >> config.numberOfInstructions >> config.numberOfJumps >> config.recordEntrance >> config.recordRegMod >> config.recordReg 
+	   >> config.recordStog >> config.stackSize >> config.recordMemory >> config.memorySize;
+   file.close();
 
    state.stepIn = false;
    state.wasCall = false;
+   state.stackDump.resize(config.stackSize);
 
 
    // log file
-   file = fopen(config.logName, "w");
+   file.open(config.logName, std::ios::out);
 
-   fprintf(file, "%lu %lu %d %d %d\n", config.numberOfInstructions, config.numberOfJumps, config.recordEntrance, config.recordRegMod, config.recordReg);
+ //  fprintf(file, "%lu %lu %d %d %d\n", config.numberOfInstructions, config.numberOfJumps, config.recordEntrance, config.recordRegMod, config.recordReg);
 
    Addtolist(0,0,"Instruction dump plugin v 0.1");
    Addtolist(0,-1,"  Copyright (C) 2015 Igor Novkovic");
@@ -75,7 +85,7 @@ extc int _export cdecl ODBG_Plugininit(int ollydbgversion,HWND hw,ulong *feature
 };
 
 extc void _export cdecl ODBG_Plugindestroy(void) {
-	fclose(file);
+	file.close();
 };
 
 extc int _export cdecl ODBG_Pluginmenu(int origin,char data[4096],void *item) {
@@ -88,8 +98,8 @@ extc int _export cdecl ODBG_Pluginmenu(int origin,char data[4096],void *item) {
 };
 
 extc void cdecl ODBG_Pluginreset(void) {
-	fclose(file);
-	file = fopen(config.logName, "w");
+	/*file.close();
+	file.open(config.logName, std::ios::in);*/
 }
 
 
@@ -104,69 +114,60 @@ extc void _export cdecl ODBG_Pluginaction(int origin,int action,void *item) {
 };
 
 
-extc int _export cdecl ODBG_Paused(int reason, t_reg *reg) {
+extc int _export cdecl ODBG_Paused(int reason,  t_reg *reg) {
 	ulong srcsize;
 	t_disasm disasm;
 	uchar cmd[MAXCMDSIZE];
 
 	switch(reason) {
-	case PP_EVENT:
-
-		if(state.wasCall == true) {
-			if(reg->ip == state.retAddr.back())
-				state.stepIn = 0;
-			else {
-				state.stepIn = 1;
-				state.regMod.push_back(false);
-			}
-			state.wasCall = false;
-		}
-
-		if(state.retAddr.size() != 0) {
-			bool modified = state.regMod.back();
-			state.regMod.pop_back();
-
-			if(modified == false && reg->modified == 1) {
-				modified = true;
-				fprintf(file, "1\n");
-			}
-
-			state.regMod.push_back(modified);
-
-			if(reg->ip == state.retAddr.back()) {
-				state.retAddr.pop_back();
-
-				/*if(config.recordRegMod == true)
-					fprintf(file, "%d\n", state.regMod.back());*/
-
-				if(config.recordRegMod == false)
-					fprintf(file, "0\n");
-
-				state.regMod.pop_back();
-			}
-		}
 		
-		
-		srcsize = Readcommand(reg->ip, (char*)cmd); 
+		case PP_EVENT:
+				if(state.wasCall == true) {					// last instruction was call
+					if(reg->ip == state.retAddr.back())	{	// current ip == address of instruction after call
+						state.stepIn = 0;					// call was steped over
+						//state.regMod.push_back(false);
+					}
+					else {
+						state.stepIn = 1;					// call was steped in
+						state.regMod.push_back(false);		// add new entry
+					}
+					state.wasCall = false;					// reset flag
 
-		if(srcsize != 0) {
+					file << "Entrance: " << state.stepIn << std::endl;
+				}
+			   
 
-			srcsize = Disasm(cmd, srcsize, reg->ip, DEC_UNKNOWN, &disasm, DISASM_ALL, NULL);
+				srcsize = Readcommand(reg->ip, (char*)cmd); 
 
-			if(disasm.error != 0)
-				break;
+				if(srcsize != 0) {
 
-			if(disasm.cmdtype == C_CAL) {							// if instruction is CALL
-				state.wasCall = true;
-				state.retAddr.push_back(reg->ip + srcsize);			// add new ret address
-				recordInstructions(&disasm, 0);						// dump instructions
-				fprintf(file, "\n");
-			}
+					srcsize = Disasm(cmd, srcsize, reg->ip, DEC_UNKNOWN, &disasm, DISASM_ALL, NULL);
 
-			return 1;
-		}
+					if(disasm.error != 0) 
+						break;
+					
+
+				//	file << disasm.result << std::endl;
+
+					if(disasm.cmdtype == C_CAL) {							// if instruction is CALL
+						state.wasCall = true;
+						state.retAddr.push_back(reg->ip + srcsize);			// add new ret address
+						recordInstructions(&disasm, 0);						// dump instructions
+
+						file << std::endl;
+						file << "Registers: " << std::hex << reg->r[0] << "  " << reg->r[1] << "  " << reg->r[2] << "  " << reg->r[3] << "  " << reg->r[4] << "  " << reg->r[5] << "  "
+							<< reg->r[6] << "  " << reg->r[7] << std::endl;		// registers dump
+
+						Readmemory(&(state.stackDump[0]), reg->r[4], config.stackSize, MM_RESILENT);	// stack dump
+						file << "Stack: " ;
+						for(int i = 0; i < state.stackDump.size(); i++)
+							file << std::hex <<(int) state.stackDump[i];
+						file << std::endl;
+					}	
+				}
 	}
-	return 0;
+
+	return 1;
 };
 
 
@@ -192,8 +193,11 @@ void cdecl recordInstructions(t_disasm *disasm, uint depth) {
 			dump.erase(std::remove(dump.begin(), dump.end(), ' '), dump.end());
 
 			if(depth < config.numberOfJumps) {
-				if(dis.cmdtype == C_CAL)							// if instruction is CALL
+				if(dis.cmdtype == C_CAL) {							// if instruction is CALL
+					file << dump;
+					file.clear();
 					recordInstructions(&dis, depth + 1);			// dump instructions
+				}
 			}
 
 			ip += srcsize;
@@ -202,5 +206,6 @@ void cdecl recordInstructions(t_disasm *disasm, uint depth) {
 			break;
 	}
 
-	fprintf(file, "%s", dump.c_str());
+	//fprintf(file, "%s", dump.c_str());
+	file << dump;
 };
