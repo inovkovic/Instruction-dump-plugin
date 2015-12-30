@@ -26,6 +26,11 @@ struct State {
 	std::vector<bool> regMod;				//  any register modified by user
 	bool wasCall;							//	last instruction was CALL
 	std::vector<char> stackDump;
+	std::vector<char> memoryDump;
+};
+
+struct MemoryBlock {
+	ulong base;
 };
 
 HINSTANCE        hinst;                // DLL instance
@@ -71,6 +76,7 @@ extc int _export cdecl ODBG_Plugininit(int ollydbgversion,HWND hw,ulong *feature
    state.stepIn = false;
    state.wasCall = false;
    state.stackDump.resize(config.stackSize);
+   state.memoryDump.resize(config.memorySize * 8);
 
 
    // log file
@@ -162,6 +168,43 @@ extc int _export cdecl ODBG_Paused(int reason,  t_reg *reg) {
 						file << "Stack: " ;
 						for(int i = 0; i < state.stackDump.size(); i++)
 							file << std::hex <<(int) state.stackDump[i];
+						file << std::endl;
+
+						for(int i = 0; i < 8; i++) {		// is a register containing pointer to a valid memory
+							t_memory *mem;
+
+							mem = Findmemory(reg->r[i]);
+
+							if(mem == NULL)
+								file << "0 ";
+							else
+								file << "1 ";
+						}
+						file << std::endl;
+
+						for(int i = 0; i < 8; i++) {		// for every register containing pointer to a valid memory make dump of that memory
+							t_memory *mem;
+
+							mem = Findmemory(reg->r[i]);
+
+							if(mem == NULL)
+								file << "0";
+							else {
+								Readmemory(&(state.memoryDump[i*config.memorySize]), reg->r[i], config.memorySize, MM_RESILENT);
+								for(int j = i*config.memorySize; j < i*config.memorySize + config.memorySize; j++)
+									file << std::hex << (int)state.memoryDump[j];
+								//file << state.memoryDump[i*config.memorySize] << " ";
+							}
+						}
+						file << std::endl;
+
+						t_table *table = (t_table *)  Plugingetvalue(VAL_MEMORY);	// write stack base
+						t_memory *mm = (t_memory *) table->data.data;
+						file << "Stack base: ";
+						for(int i = 0; i < table->data.n; i++) {
+							if((mm+i)->type == 0x04000000)
+								file << (mm+i)->base << "  ";
+						}
 						file << std::endl;
 					}	
 				}
