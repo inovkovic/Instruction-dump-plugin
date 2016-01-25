@@ -49,6 +49,7 @@ struct Block {
 	ulong probableEndAdd;
 	bool wasCalled;
 	bool exception;
+	bool breakpoint;
 	std::string stackDump;
 	std::string calledInstructionsDump;
 	std::string instructionDump;
@@ -56,11 +57,9 @@ struct Block {
 	bool pointers[8];
 	std::string memoryDump;
 	std::vector<Module> modules;
-	std::vector<Module> after;
+	std::vector<Module> modulesAfter;
 	size_t blockSignature;
 };
-
-// ako se nastavlja debugankja iz datoteke procitati lastblocksignature ako ne postoji entry staviti trenutni blokc kao prvi
 
 HINSTANCE        hinst;                // DLL instance
 HWND             hwmain;               // Handle of main OllyDbg window
@@ -93,9 +92,19 @@ size_t cdecl hashIntArray(int *i, int size);
 
 size_t cdecl hashString(std::string& s);
 
-size_t cdecl signBlock(int index);
+void cdecl signBlock(int index);
 
-std::string arrayToString(int *i, int size);
+std::string cdecl arrayToString(int *i, int size);
+
+bool cdecl isEmpty(std::fstream &file);
+
+void cdecl writeBlocktToFile(Block &block, std::fstream &file);
+
+bool cdecl addressCheck(DWORD address, Block &block);
+
+bool cdecl checkAddressRange(DWORD address);
+
+void cdecl createNewBlock(ulong startAddress, ulong endAddress, t_reg *reg);
 
 
 BOOL WINAPI DllEntryPoint(HINSTANCE hi,DWORD reason,LPVOID reserved) {
@@ -131,13 +140,24 @@ extc int _export cdecl ODBG_Plugininit(int ollydbgversion,HWND hw,ulong *feature
 
 
    // log file
-   file.open(config.logName, std::ios::out);
+   file.open(config.logName, std::ios::in | std::ios::out);
+
+
+   if(isEmpty(file) == false) {
+	   file.seekg(-1 * (signed int)sizeof(size_t), std::ios_base::end);
+	   file >> state.lastSignature;
+	   file.seekg(0, std::ios_base::beg);
+   }
 
    Addtolist(0,0,"Instruction dump plugin v 0.1");
    Addtolist(0,-1,"  Copyright (C) 2015 Igor Novkovic");
  
    return 0;
 };
+
+bool isEmpty(std::fstream &file) {
+	return file.peek() == std::ifstream::traits_type::eof();
+}
 
 extc void _export cdecl ODBG_Plugindestroy(void) {
 	file.close();
@@ -156,7 +176,7 @@ extc void cdecl ODBG_Pluginreset(void) {
 	state.timev = time(0);
 	hashInt(state.timev);
 
-	if(file.is_open == false) {
+	if(file.is_open() == false) {
 		file.open(config.logName, std::ios::out);
 	}
 }
@@ -171,6 +191,22 @@ extc void _export cdecl ODBG_Pluginaction(int origin,int action,void *item) {
   }
 };
 
+bool cdecl addressCheck(DWORD address, Block &block) {
+	return (address > block.startAddress && address < block.probableEndAdd) ? true : false;
+}
+
+bool cdecl checkAddressRange(DWORD address) {
+	t_module *module = Findmodule(address);
+
+	if(module == NULL)
+		return false;
+
+	if(address > module->codebase && address < (module->codecrc + module->codesize))
+		return true;
+
+	return false;
+}
+
 
 extc int _export cdecl ODBG_Pausedex(int reasonex, int dummy, t_reg *reg, DEBUG_EVENT *debugevent) {
 	ulong srcsize;
@@ -180,16 +216,94 @@ extc int _export cdecl ODBG_Pausedex(int reasonex, int dummy, t_reg *reg, DEBUG_
 	if(reg == NULL)
 		return 1;
 
+	for(uint i = 0; i < state.totalBlocks; i++) {
+		Block block = blocks[i];
 
+		if(reg->ip > block.probableEndAdd || reg->ip < block.startAddress) {
+			instructionDump(block.startAddress, 0, block.instructionDumpAfter);
+			modulesDump(block.modulesAfter);
+			state.completeBlocks[i] = true;
+			state.completedBlocks++;
+		}
+	}
+
+	
 	switch(reasonex) {
+
+	case PP_EXCEPTION:
+	case PP_INT3BREAK:
+	case PP_MEMBREAK:
+
+		srcsize = Readcommand(reg->ip, (char*)cmd); 
+
+		if(srcsize != 0) {
+
+			srcsize = Disasm(cmd, srcsize, reg->ip, DEC_UNKNOWN, &disasm, DISASM_ALL, NULL);
+
+			if(disasm.error != 0) 
+				break;
+					
+
+			if(disasm.cmdtype == C_CAL || disasm.cmdtype == C_JMP) {	
+				if(Findmodule(disasm.jmpaddr) == NULL)
+					break;
+
+				createNewBlock(disasm.jmpaddr, disasm.ip + srcsize, reg);
+						
+				state.retAddr.push_back(reg->ip + srcsize);		
+				}
+		}
 		
-		case PP_EVENT:
+
+		if(state.totalBlocks == 0 || addressCheck(reg->ip, blocks[state.totalBlocks - 1]) == false) {
+			DWORD startAddress = reg->ip - config.numberOfInstructions - 1;
+			DWORD endAddress = reg->ip + config.numberOfInstructions / 2;
+
+			if(checkAddressRange(startAddress) == false) {
+				startAddress = reg->ip;
+				endAddress = startAddress + config.numberOfInstructions;
+			}
+
+			if(checkAddressRange(endAddress) == false)
+				endAddress -= config.numberOfInstructions / 2;
+
+			if(checkAddressRange(endAddress) == false)
+				endAddress = startAddress;
+
+			createNewBlock(startAddress, endAddress, reg);
+
+			Block block = blocks.back();
+			block.wasCalled = true;
+			blocks.pop_back();
+			blocks.push_back(block);
+		}
+
+
+		else if(state.totalBlocks > 0 && addressCheck(reg->ip, blocks[state.totalBlocks - 1]) == true) {
+			Block block = blocks.back();
+			
+			if((reasonex & PP_EXCEPTION) == PP_EXCEPTION)
+				block.exception = true;
+			if((reasonex & PP_INT3BREAK) == PP_INT3BREAK)
+				block.breakpoint = true;
+
+			blocks.pop_back();
+			blocks.push_back(block);
+		}
+
+		break;
+		
+
+	case PP_SINGLESTEP:
 				if(state.wasCall == true) {					// last instruction was call
 					Block block = blocks.back();
 					if(reg->ip == state.retAddr.back())		// current ip == address of instruction after call
 						block.wasCalled = true;				// call was steped over
 					else 
 						block.wasCalled = false;			// call was steped in
+
+					blocks.pop_back();
+					blocks.push_back(block);
 					
 					state.wasCall = false;					// reset flag
 				}
@@ -205,43 +319,53 @@ extc int _export cdecl ODBG_Pausedex(int reasonex, int dummy, t_reg *reg, DEBUG_
 						break;
 					
 
-					if(disasm.cmdtype == C_CAL || disasm.cmdtype == C_JMP) {	// promijenit jmp jxx						// if instruction is CALL or JXX
-						Block block;
-						block.blockMark = state.blockMark;
-
+					if(disasm.cmdtype == C_CAL || disasm.cmdtype == C_JMP) {	
+						createNewBlock(disasm.jmpaddr, disasm.ip + srcsize, reg);
+						
 						state.wasCall = true;
-						state.retAddr.push_back(reg->ip + srcsize);										// add new ret address
-
-						block.startAddress = disasm.jmpaddr;
-
-						instructionDump(disasm.jmpaddr, 0, block.calledInstructionsDump);
-
-						registerDump(reg, block.reg);
-
-						block.stackDump.resize(config.stackSize);
-						stackDump(reg, block.stackDump);
-
-						checkRegValues(block.reg, block.pointers);
-
-						block.memoryDump.resize(config.memorySize * 8);
-						memoryDump(block, block.memoryDump);
-
-						stackBaseDump(reg, block.stackBase);
-
-						modulesDump(block.modules);
-
-						instructionDump(disasm.ip + srcsize, 0, block.instructionDump);
-
-						blocks.push_back(block);
-						state.totalBlocks++;
-						state.completeBlocks.push_back(false);
-						state.signBlocks.push_back(false);
-					}	
+						state.retAddr.push_back(reg->ip + srcsize);		
+					}
 				}
 	}
 
 	return 1;
 };
+
+void cdecl createNewBlock(ulong startAddress, ulong endAddress, t_reg *reg) {
+	Block block;
+
+	block.exception = false;
+	block.breakpoint = false;
+	block.wasCalled = false;
+
+	instructionDump(startAddress, 0, block.calledInstructionsDump);
+	instructionDump(endAddress, 0, block.instructionDump);
+
+	block.blockMark = state.blockMark;
+
+	block.startAddress = startAddress;
+	block.probableEndAdd = startAddress + config.numberOfInstructions;
+			
+
+	registerDump(reg, block.reg);
+
+	block.stackDump.resize(config.stackSize);
+	stackDump(reg, block.stackDump);
+
+	checkRegValues(block.reg, block.pointers);
+
+	block.memoryDump.resize(config.memorySize * 8);
+	memoryDump(block, block.memoryDump);
+
+	stackBaseDump(reg, block.stackBase);
+
+	modulesDump(block.modules);
+
+	blocks.push_back(block);
+	state.totalBlocks++;
+	state.completeBlocks.push_back(false);
+	state.signBlocks.push_back(false);
+}
 
 void cdecl modulesDump(std::vector<Module> &modules) {
 	t_table *table =(t_table *) Plugingetvalue(VAL_MODULES);		// write information about all modules in the process
@@ -292,7 +416,7 @@ void cdecl checkRegValues(ulong *reg, bool *pointers) {
 	}
 }
 
-void cdecl memoryDump(Block &block, std::vector<char> &dump) {
+void cdecl memoryDump(Block &block, std::string &dump) {
 	ulong boundary = 0;
 
 	for(int i = 0; i < 8; i++) {
@@ -305,7 +429,7 @@ void cdecl memoryDump(Block &block, std::vector<char> &dump) {
 
 }
 
-void cdecl stackDump(t_reg *reg, std::vector<char> &dump) {
+void cdecl stackDump(t_reg *reg, std::string &dump) {
 	Readmemory(&dump[0], reg->r[4], config.stackSize, MM_RESILENT);					
 }
 
@@ -319,11 +443,10 @@ void cdecl instructionDump(ulong addr, uint depth, std::string &buffer) {
 	uchar cmd[MAXCMDSIZE]; 
 	std::string dump;
 	t_disasm dis;
-	int i, j;
+	uint i;//, j;
 
 	for(i = 0; i < config.numberOfInstructions; i++) {
 		srcsize = Readcommand(addr,(char*)cmd);
-
 		if(srcsize != 0) {
 			srcsize = Disasm(cmd, srcsize, addr, DEC_UNKNOWN, &dis, DISASM_ALL, NULL);
 
@@ -332,9 +455,9 @@ void cdecl instructionDump(ulong addr, uint depth, std::string &buffer) {
 
 			buffer += dis.dump;
 
-			buffer.erase(std::remove(dump.begin(), dump.end(), ' '), dump.end());
-			buffer.erase(std::remove(dump.begin(), dump.end(), ':'), dump.end());
-
+			buffer.erase(std::remove(buffer.begin(), buffer.end(), ' '), buffer.end());
+			buffer.erase(std::remove(buffer.begin(), buffer.end(), ':'), buffer.end());
+	
 			if(depth < config.numberOfJumps) {
 				if(dis.cmdtype == C_CAL || dis.cmdtype == C_JMP) {							// if instruction is CALL
 					instructionDump(dis.jmpaddr, depth + 1, buffer);			// dump instructions
@@ -350,7 +473,7 @@ void cdecl instructionDump(ulong addr, uint depth, std::string &buffer) {
 
 void cdecl ODBG_Pluginmainloop(DEBUG_EVENT *debugevent) {
 	if(state.completedBlocks > state.signedBlocks) {
-		for(int i = 0; i < state.totalBlocks; i++) {
+		for(uint i = 0; i < state.totalBlocks; i++) {
 			if(state.completeBlocks[i] == true && state.signBlocks[i] == false) {
 				if(i == 0)
 					signBlock(0);
@@ -390,7 +513,7 @@ size_t hashString(std::string& s) {
 	return stringHash(s);
 }
 
-size_t signBlock(int index) {
+void signBlock(int index) {
 	std::string block;
 	Block b = blocks[index];
 
@@ -401,7 +524,7 @@ size_t signBlock(int index) {
 	for(int i = 0; i < size; i++) {
 		Module mod = b.modules[i];
 
-		block += (mod.name + std::to_string(mod.base) + std::to_string(mod.size) + std::to_string(mod.codeBase) + std::to_string(mod.codeSize) + std::to_string(mod.dataBase);
+		block += (mod.name + std::to_string(mod.base) + std::to_string(mod.size) + std::to_string(mod.codeBase) + std::to_string(mod.codeSize) + std::to_string(mod.dataBase));
 	}
 
 	if(state.totalBlocks > 1)
